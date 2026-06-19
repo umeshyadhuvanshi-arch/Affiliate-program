@@ -1,0 +1,315 @@
+import { useState, useEffect, useRef } from "react";
+
+const SUPABASE_URL = "https://uigsvlsrrmytpsbpxlvq.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVpZ3N2bHNycm15dHBzYnB4bHZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODE4NTk5MjQsImV4cCI6MjA5NzQzNTkyNH0.HYklmvDN0Ek1SYxCEyGmsF0e2c7x0z2BDluqBOPRmeY";
+
+async function sb(path, options = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    headers: {
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": options.prefer || "return=representation",
+      ...options.headers,
+    },
+    ...options,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || "Database error");
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+const DB = {
+  async findUserByPhone(phone) {
+    const rows = await sb(`users?phone_number=eq.${encodeURIComponent(phone)}&limit=1`);
+    return rows?.[0] || null;
+  },
+  async findUserByCode(code) {
+    const rows = await sb(`users?referral_code=eq.${encodeURIComponent(code)}&limit=1`);
+    return rows?.[0] || null;
+  },
+  async createUser(phone, referralCode) {
+    let referredById = null;
+    if (referralCode) {
+      const ref = await DB.findUserByCode(referralCode);
+      if (ref) referredById = ref.id;
+    }
+    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const rows = await sb("users", {
+      method: "POST",
+      body: JSON.stringify({ phone_number: phone, referral_code: code, referred_by_id: referredById, wallet_balance: 0, has_purchased: false }),
+    });
+    return rows?.[0] || null;
+  },
+  async processPayment(userId) {
+    await sb(`users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify({ has_purchased: true }) });
+    await sb("transactions", { method: "POST", body: JSON.stringify({ user_id: userId, amount: 100, status: "success", gateway_order_id: "UPI_" + Date.now() }) });
+    const userRows = await sb(`users?id=eq.${userId}&limit=1`);
+    const user = userRows?.[0];
+    if (user?.referred_by_id) {
+      const refRows = await sb(`users?id=eq.${user.referred_by_id}&limit=1`);
+      const referrer = refRows?.[0];
+      if (referrer) await sb(`users?id=eq.${user.referred_by_id}`, { method: "PATCH", body: JSON.stringify({ wallet_balance: referrer.wallet_balance + 50 }) });
+    }
+  },
+  async getUser(userId) {
+    const rows = await sb(`users?id=eq.${userId}&limit=1`);
+    return rows?.[0] || null;
+  },
+  async getAllUsers() { return await sb("users?order=created_at.desc") || []; },
+  async getAllWithdrawals() { return await sb("withdrawals?order=created_at.desc") || []; },
+  async createWithdrawal(userId, amount, upiId) {
+    const rows = await sb("withdrawals", { method: "POST", body: JSON.stringify({ user_id: userId, amount, upi_id: upiId, status: "pending" }) });
+    return rows?.[0] || null;
+  },
+  async markWithdrawalPaid(wId, userId, amount) {
+    await sb(`withdrawals?id=eq.${wId}`, { method: "PATCH", body: JSON.stringify({ status: "completed" }) });
+    const userRows = await sb(`users?id=eq.${userId}&limit=1`);
+    const user = userRows?.[0];
+    if (user) await sb(`users?id=eq.${userId}`, { method: "PATCH", body: JSON.stringify({ wallet_balance: Math.max(0, user.wallet_balance - amount) }) });
+  },
+};
+
+function getPdfUrl() { try { return localStorage.getItem("pdf_url") || "https://www.africau.edu/images/default/sample.pdf"; } catch(e) { return ""; } }
+function savePdfUrl(url) { try { localStorage.setItem("pdf_url", url); } catch(e) {} }
+
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0A0F1E; color: #E8EAF0; font-family: 'Inter', sans-serif; min-height: 100vh; }
+  .app { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; background: radial-gradient(ellipse at 50% 0%, #1a1240 0%, #0A0F1E 70%); }
+  .coin-wrap { width: 80px; height: 80px; margin: 0 auto 32px; }
+  .coin { width: 80px; height: 80px; border-radius: 50%; background: conic-gradient(#F5C842, #e6a800, #F5C842, #fff5b0, #F5C842); animation: coinSpin 4s linear infinite, coinPulse 2s ease-in-out infinite alternate; display: flex; align-items: center; justify-content: center; font-size: 32px; }
+  @keyframes coinSpin { 0%{transform:rotateY(0deg)} 100%{transform:rotateY(360deg)} }
+  @keyframes coinPulse { from{box-shadow:0 0 30px 8px rgba(245,200,66,0.2)} to{box-shadow:0 0 60px 20px rgba(245,200,66,0.35)} }
+  .card { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; padding: 40px 32px; width: 100%; max-width: 400px; backdrop-filter: blur(12px); }
+  .headline { font-size: 13px; font-weight: 600; letter-spacing: 3px; text-transform: uppercase; color: #6C63FF; text-align: center; margin-bottom: 8px; }
+  .title { font-size: 32px; font-weight: 700; text-align: center; color: #fff; line-height: 1.1; margin-bottom: 6px; }
+  .subtitle { font-size: 14px; color: rgba(255,255,255,0.45); text-align: center; margin-bottom: 32px; }
+  .btn-primary { width: 100%; padding: 16px; background: linear-gradient(135deg, #6C63FF, #9B8FFF); border: none; border-radius: 12px; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 20px rgba(108,99,255,0.35); margin-bottom: 0; }
+  .btn-primary:hover { transform: translateY(-1px); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .btn-gold { width: 100%; padding: 16px; background: linear-gradient(135deg, #F5C842, #e6a800); border: none; border-radius: 12px; color: #0A0F1E; font-size: 16px; font-weight: 700; cursor: pointer; transition: all 0.2s; }
+  .btn-gold:hover { transform: translateY(-1px); }
+  .btn-outline { width: 100%; padding: 16px; background: transparent; border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; color: rgba(255,255,255,0.8); font-size: 16px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+  .btn-outline:hover { border-color: rgba(108,99,255,0.6); background: rgba(108,99,255,0.08); }
+  .btn-sm { padding: 8px 16px; background: linear-gradient(135deg, #6C63FF, #9B8FFF); border: none; border-radius: 8px; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .btn-sm:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-success-sm { padding: 6px 12px; background: rgba(80,220,120,0.15); border: 1px solid rgba(80,220,120,0.3); border-radius: 6px; color: #4ade80; font-size: 12px; font-weight: 600; cursor: pointer; }
+  .input { width: 100%; padding: 14px 16px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: #fff; font-size: 16px; font-family: 'Inter', sans-serif; outline: none; transition: border-color 0.2s; margin-bottom: 12px; }
+  .input::placeholder { color: rgba(255,255,255,0.3); }
+  .input:focus { border-color: #6C63FF; background: rgba(108,99,255,0.08); }
+  .otp-row { display: flex; gap: 8px; justify-content: center; margin-bottom: 20px; }
+  .otp-box { width: 52px; height: 56px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: #fff; font-size: 22px; font-family: 'JetBrains Mono', monospace; font-weight: 600; text-align: center; outline: none; }
+  .otp-box:focus { border-color: #6C63FF; background: rgba(108,99,255,0.1); }
+  .qr-wrap { display: flex; flex-direction: column; align-items: center; gap: 16px; margin: 24px 0; }
+  .qr-frame { width: 200px; height: 200px; background: #fff; border-radius: 12px; display: flex; align-items: center; justify-content: center; padding: 12px; animation: qrGlow 1.5s ease-in-out infinite alternate; }
+  @keyframes qrGlow { from{box-shadow:0 0 20px rgba(108,99,255,0.15)} to{box-shadow:0 0 50px rgba(108,99,255,0.4)} }
+  .wallet-card { background: linear-gradient(135deg, rgba(245,200,66,0.1), rgba(245,200,66,0.05)); border: 1px solid rgba(245,200,66,0.2); border-radius: 14px; padding: 20px; margin-top: 20px; }
+  .wallet-label { font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: rgba(245,200,66,0.6); margin-bottom: 6px; }
+  .wallet-amount { font-family: 'JetBrains Mono', monospace; font-size: 28px; font-weight: 600; color: #F5C842; margin-bottom: 16px; }
+  .ref-box { background: rgba(108,99,255,0.08); border: 1px solid rgba(108,99,255,0.2); border-radius: 10px; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; cursor: pointer; }
+  .ref-url { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #9B8FFF; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .divider { height: 1px; background: rgba(255,255,255,0.07); margin: 24px 0; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot-pending { background: #F5C842; animation: blink 1s infinite; }
+  .dot-success { background: #4ade80; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .admin-wrap { width: 100%; max-width: 900px; padding: 32px 24px; }
+  .admin-section { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 16px; padding: 24px; margin-bottom: 20px; }
+  .section-head { font-size: 12px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: #6C63FF; margin-bottom: 16px; }
+  .table { width: 100%; border-collapse: collapse; }
+  .table th { text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: rgba(255,255,255,0.35); padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+  .table td { padding: 10px 12px; font-size: 13px; color: rgba(255,255,255,0.8); border-bottom: 1px solid rgba(255,255,255,0.04); font-family: 'JetBrains Mono', monospace; }
+  .table tr:last-child td { border-bottom: none; }
+  .pill { display: inline-block; padding: 3px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; font-family: 'Inter', sans-serif; }
+  .pill-green { background: rgba(74,222,128,0.15); color: #4ade80; }
+  .pill-yellow { background: rgba(245,200,66,0.15); color: #F5C842; }
+  .err { color: #ff6b6b; font-size: 13px; text-align: center; margin-bottom: 10px; }
+  .success-msg { color: #4ade80; font-size: 13px; text-align: center; margin-top: 8px; }
+  .note { font-size: 12px; color: rgba(255,255,255,0.35); text-align: center; margin-top: 12px; line-height: 1.6; }
+  .back-btn { background: none; border: none; color: rgba(255,255,255,0.4); font-size: 13px; cursor: pointer; padding: 0; margin-bottom: 20px; font-family: 'Inter', sans-serif; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 100; backdrop-filter: blur(4px); }
+  .modal { background: #131929; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; padding: 32px; width: 100%; max-width: 360px; }
+  .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 20px; color: #fff; }
+  .gap { height: 12px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+`;
+
+function QRCode({ value, size = 176 }) {
+  const cells = 21, cellSize = size / cells;
+  const hash = Array.from(value).reduce((a, c) => a + c.charCodeAt(0), 0);
+  const grid = Array.from({ length: cells }, (_, r) =>
+    Array.from({ length: cells }, (_, c) => {
+      if ((r < 7 && c < 7) || (r < 7 && c >= cells - 7) || (r >= cells - 7 && c < 7)) return 1;
+      if (r === 6 || c === 6) return (r + c) % 2 === 0 ? 1 : 0;
+      return ((hash * (r + 1) * (c + 1) + r * 31 + c * 17) % 3 === 0) ? 1 : 0;
+    })
+  );
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <rect width={size} height={size} fill="white" />
+      {grid.map((row, r) => row.map((cell, c) => cell ? <rect key={`${r}-${c}`} x={c*cellSize} y={r*cellSize} width={cellSize} height={cellSize} fill="#0A0F1E" /> : null))}
+    </svg>
+  );
+}
+
+function PhoneScreen({ onNext, prefillRef }) {
+  const [phone, setPhone] = useState("");
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+  async function go() {
+    const cleaned = phone.replace(/\D/g, "");
+    if (cleaned.length < 10) { setErr("Enter a valid 10-digit number"); return; }
+    setErr(""); setLoading(true);
+    try { await onNext("+91" + cleaned.slice(-10)); } catch(e) { setErr(e.message); setLoading(false); }
+  }
+  return (
+    <div className="card">
+      <div className="coin-wrap"><div className="coin">₹</div></div>
+      <div className="headline">Affiliate Program</div>
+      <div className="title">Money Earning</div>
+      <div className="subtitle">Pay once. Earn forever.</div>
+      {prefillRef && <div style={{textAlign:"center",marginBottom:20}}><span className="pill pill-green">Referral code applied ✓</span></div>}
+      <input className="input" placeholder="Phone number (10 digits)" value={phone} onChange={e=>setPhone(e.target.value)} type="tel" maxLength={10} onKeyDown={e=>e.key==="Enter"&&go()} />
+      {err && <div className="err">{err}</div>}
+      <button className="btn-primary" onClick={go} disabled={loading}>{loading?"Please wait...":"Continue"}</button>
+      <div className="note">We'll send a verification code to your number.</div>
+    </div>
+  );
+}
+
+function OTPScreen({ phone, onVerified, isNew, goBack }) {
+  const [otp, setOtp] = useState(["","","",""]);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [cd, setCd] = useState(30);
+  const refs = [useRef(),useRef(),useRef(),useRef()];
+  useEffect(() => { const t = setInterval(()=>setCd(c=>c>0?c-1:0),1000); return ()=>clearInterval(t); }, []);
+  function change(i, val) {
+    if (!/^\d?$/.test(val)) return;
+    const n=[...otp]; n[i]=val; setOtp(n);
+    if (val && i<3) refs[i+1].current.focus();
+  }
+  function keydown(i,e) { if(e.key==="Backspace"&&!otp[i]&&i>0) refs[i-1].current.focus(); }
+  async function verify() {
+    const code=otp.join("");
+    if (code.length<4){setErr("Enter the 4-digit OTP");return;}
+    if (code!=="1234"){setErr("Incorrect OTP. (Demo: use 1234)");return;}
+    setLoading(true);
+    try { await onVerified(); } catch(e) { setErr(e.message); setLoading(false); }
+  }
+  return (
+    <div className="card">
+      <button className="back-btn" onClick={goBack}>← Back</button>
+      <div className="headline">Verify</div>
+      <div className="title" style={{fontSize:24}}>Enter OTP</div>
+      <div className="subtitle">Sent to {phone}</div>
+      <div className="otp-row">
+        {otp.map((v,i)=><input key={i} ref={refs[i]} className="otp-box" maxLength={1} value={v} onChange={e=>change(i,e.target.value)} onKeyDown={e=>keydown(i,e)} type="tel"/>)}
+      </div>
+      {err && <div className="err">{err}</div>}
+      <button className="btn-primary" onClick={verify} disabled={loading}>{loading?"Verifying...":`Verify & ${isNew?"Register":"Login"}`}</button>
+      <div className="note">
+        {cd>0?`Resend in ${cd}s`:<span style={{color:"#6C63FF",cursor:"pointer"}} onClick={()=>setCd(30)}>Resend OTP</span>}
+        <br/><span style={{color:"#F5C842"}}>Demo: use OTP 1234</span>
+      </div>
+    </div>
+  );
+}
+
+function PrePurchaseScreen({ onBuy }) {
+  return (
+    <div className="card">
+      <div className="coin-wrap"><div className="coin">₹</div></div>
+      <div className="headline">Affiliate Program</div>
+      <div className="title">Money Earning</div>
+      <div className="subtitle">Unlock the system. Start earning today.</div>
+      <button className="btn-gold" onClick={onBuy}>Buy Now — ₹100</button>
+    </div>
+  );
+}
+
+function PaymentScreen({ user, onSuccess }) {
+  const upiString = `upi://pay?pa=yourmerchant@upi&pn=AffiliateApp&am=100&cu=INR&tn=Purchase_${user.id}`;
+  const [paid, setPaid] = useState(false);
+  const [cd, setCd] = useState(8);
+  useEffect(()=>{
+    const t=setInterval(()=>setCd(c=>{
+      if(c<=1){
+        clearInterval(t);
+        DB.processPayment(user.id).then(()=>{setPaid(true);setTimeout(onSuccess,800);});
+        return 0;
+      }
+      return c-1;
+    }),1000);
+    return ()=>clearInterval(t);
+  },[]);
+  return (
+    <div className="card">
+      <div className="headline">Complete Payment</div>
+      <div className="title" style={{fontSize:22}}>Scan & Pay</div>
+      <div className="subtitle">Open any UPI app and scan</div>
+      <div className="qr-wrap">
+        <div className="qr-frame"><QRCode value={upiString} size={176}/></div>
+        <div style={{fontFamily:"JetBrains Mono",fontSize:26,fontWeight:700,color:"#F5C842"}}>₹100</div>
+        <div style={{display:"flex",alignItems:"center",gap:6,fontSize:13}}>
+          <span className={`dot ${paid?"dot-success":"dot-pending"}`}/>
+          <span style={{color:paid?"#4ade80":"#F5C842"}}>{paid?"Payment confirmed!":"Waiting for payment..."}</span>
+        </div>
+      </div>
+      {!paid && <div className="note">Demo: auto-confirming in <span style={{color:"#F5C842",fontFamily:"JetBrains Mono"}}>{cd}s</span><br/>In production, connect Razorpay webhook here.</div>}
+    </div>
+  );
+}
+
+function DashboardScreen({ user }) {
+  const [copied, setCopied] = useState(false);
+  const [showWithdraw, setShowWithdraw] = useState(false);
+  const [liveUser, setLiveUser] = useState(user);
+  const ref = `${window.location.origin}${window.location.pathname}?ref=${liveUser.referral_code}`;
+  useEffect(()=>{ DB.getUser(user.id).then(u=>{if(u)setLiveUser(u);}); },[showWithdraw]);
+  function copyRef(){navigator.clipboard.writeText(ref).catch(()=>{});setCopied(true);setTimeout(()=>setCopied(false),2000);}
+  return (
+    <div className="card">
+      <div className="headline">Dashboard</div>
+      <div className="title" style={{fontSize:22,marginBottom:4}}>You're in.</div>
+      <div className="subtitle">Your affiliate tools are ready.</div>
+      <a href={getPdfUrl()} target="_blank" rel="noreferrer" style={{textDecoration:"none",display:"block",marginBottom:12}}>
+        <button className="btn-primary" style={{width:"100%"}}>⬇ Download PDF</button>
+      </a>
+      <div className="divider"/>
+      <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",marginBottom:10,letterSpacing:2,textTransform:"uppercase"}}>Referral Link</div>
+      <div className="ref-box" onClick={copyRef}>
+        <span className="ref-url">{ref}</span>
+        <span style={{fontSize:14,opacity:0.6,flexShrink:0}}>{copied?"✓":"⎘"}</span>
+      </div>
+      {copied && <div className="success-msg">Copied!</div>}
+      <button className="btn-outline" onClick={copyRef}>Share Referral Link</button>
+      <div className="wallet-card">
+        <div className="wallet-label">Wallet Balance</div>
+        <div className="wallet-amount">₹{liveUser.wallet_balance}</div>
+        <button className="btn-sm" onClick={()=>setShowWithdraw(true)} disabled={liveUser.wallet_balance<50}>Withdraw</button>
+        {liveUser.wallet_balance<50&&<div className="note" style={{marginTop:10}}>Min withdrawal: ₹50. Earn by referring!</div>}
+      </div>
+      {showWithdraw&&<WithdrawModal user={liveUser} onClose={()=>setShowWithdraw(false)}/>}
+    </div>
+  );
+}
+
+function WithdrawModal({ user, onClose }) {
+  const [amount, setAmount] = useState("50");
+  const [upiId, setUpiId] = useState("");
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(false);
+  const [loading, setLoading] = useState(false);
+  async function submit(){
+    const amt=parseInt(amount);
+    if(!amt||amt<50){setErr("Minimum ₹50");return;}
+    if(amt>user.wallet_balance){setErr("Insufficient balance");return;}
+    if(!upiId.includes("@")){setErr("Enter valid UPI ID (e.g. name@upi)");return;}
+    setLoading(true);
+    try{aw
